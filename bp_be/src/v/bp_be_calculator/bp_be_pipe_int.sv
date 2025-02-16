@@ -17,7 +17,8 @@ module bp_be_pipe_int
  import bp_be_pkg::*;
  #(parameter bp_params_e bp_params_p = e_bp_default_cfg
    `declare_bp_proc_params(bp_params_p)
-   `declare_bp_be_if_widths(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p, fetch_ptr_p, issue_ptr_p)
+
+   , localparam reservation_width_lp = `bp_be_reservation_width(vaddr_width_p)
    )
   (input                                    clk_i
    , input                                  reset_i
@@ -38,7 +39,7 @@ module bp_be_pipe_int
   // Suppress unused signal warning
   wire unused = &{clk_i, reset_i, flush_i};
 
-  `declare_bp_be_if(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p, fetch_ptr_p, issue_ptr_p);
+  `declare_bp_be_internal_if_structs(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p);
   bp_be_reservation_s reservation;
   bp_be_decode_s decode;
   rv64_instr_s instr;
@@ -47,158 +48,424 @@ module bp_be_pipe_int
   assign decode = reservation.decode;
   assign instr = reservation.instr;
   wire [vaddr_width_p-1:0] pc  = reservation.pc;
-  wire [int_rec_width_gp-1:0] rs1 = reservation.isrc1;
-  wire [int_rec_width_gp-1:0] rs2 = reservation.isrc2;
-  wire [int_rec_width_gp-1:0] imm = reservation.isrc3;
-  wire opw_v = (decode.irs1_tag == e_int_word);
+  wire [dword_width_gp-1:0] rs1 = reservation.isrc1;
+  wire [dword_width_gp-1:0] rs2 = reservation.isrc2;
+  wire [dword_width_gp-1:0] imm = reservation.isrc3;
+  wire word_op = (decode.int_tag == e_int_word);
 
-  localparam num_bytes_lp = dword_width_gp>>3;
-  localparam lg_bits_lp = `BSG_SAFE_CLOG2(dword_width_gp);
+  // Sign-extend PC for calculation
+  wire [dword_width_gp-1:0] pc_sext_li = `BSG_SIGN_EXTEND(pc, dword_width_gp);
+  wire [dword_width_gp-1:0] pc_plus4   = pc_sext_li + dword_width_gp'(4);
 
-  // Shift calculation
-  logic [rv64_shamt_width_gp-1:0] shamt, shamtn;
-  wire [rv64_shamt_width_gp-1:0] shmask = {!opw_v, 5'b11111};
-  assign shamt = (decode.irs2_r_v ? rs2 : imm) & shmask;
-  assign shamtn = (opw_v ? 32 : 64) - shamt;
+  wire [dword_width_gp-1:0] src1  = decode.src1_sel  ? pc_sext_li : rs1;
+  wire [dword_width_gp-1:0] src2  = decode.src2_sel  ? imm        : rs2;
 
-  // We need a separate adder here to do branch comparison + address calc
-  wire [vaddr_width_p-1:0] baddr = decode.jr_v ? rs1 : pc;
-  wire [vaddr_width_p-1:0] taken_raw = baddr + imm;
-  wire [vaddr_width_p-1:0] taken_tgt = taken_raw & {{vaddr_width_p-1{1'b1}}, 1'b0};
-  wire [vaddr_width_p-1:0] ntaken_tgt = pc + (reservation.size << 1'b1);
-  wire [dword_width_gp-1:0] ntaken_data = `BSG_SIGN_EXTEND(ntaken_tgt, dword_width_gp);
-  wire [dword_width_gp-1:0] pc_data = `BSG_SIGN_EXTEND(pc, dword_width_gp);
-
-  logic [dword_width_gp-1:0] src1;
-  wire [int_rec_width_gp-1:0] rs1_rev = {<<{rs1}};
-  always_comb
-    case (decode.src1_sel)
-      e_src1_is_rs1     : src1 = decode.irs1_r_v ? rs1 : pc_data;
-      e_src1_is_rs1_rev : src1 = rs1_rev >> 1'b1;
-      e_src1_is_rs1_lsh : src1 = rs1 <<  shamt;
-      e_src1_is_rs1_lshn: src1 = rs1 << shamtn;
-      e_src1_is_zero    : src1 = '0;
-      // e_src1_is_zero
-      default : src1 = '0;
-    endcase
-
-  logic [dword_width_gp-1:0] src2;
-  always_comb
-    case (decode.src2_sel)
-      e_src2_is_rs2     : src2 = decode.irs2_r_v ? rs2 : imm;
-      e_src2_is_rs2n    : src2 = ~rs2;
-      e_src2_is_rs1_rsh : src2 = $signed(rs1) >>>  shamt;
-      e_src2_is_rs1_rshn: src2 = $signed(rs1) >>> shamtn;
-      // e_src2_is_zero
-      default : src2 = '0;
-    endcase
-
-  // Main adder
-  logic carry;
-  logic [dword_width_gp:0] sum;
-  assign {carry, sum} = {src1[dword_width_gp-1], src1} + {src2[dword_width_gp-1], src2} + decode.carryin;
-  wire sum_zero = ~|sum;
-  wire sum_sign = sum[dword_width_gp];
-
-  // Comparator (also used for branching)
-  logic comp_result;
-  always_comb
-    unique case (decode.fu_op)
-      // Comparator
-      e_int_op_min  ,
-      e_int_op_slt  : comp_result =  sum_sign;
-      e_int_op_minu ,
-      e_int_op_sltu : comp_result = !carry;
-      e_int_op_max  ,
-      e_int_op_sge  : comp_result = !sum_sign;
-      e_int_op_maxu ,
-      e_int_op_sgeu : comp_result = carry;
-
-      e_int_op_ne   : comp_result = !sum_zero;
-      // e_int_op_eq
-      default : comp_result = sum_zero;
-    endcase
-
-  // Bitmanip
-  logic [`BSG_WIDTH(dword_width_gp)-1:0] popcount;
-  bsg_popcount
-   #(.width_p(dword_width_gp))
-   popc
-    (.i(rs1[0+:dword_width_gp]), .o(popcount));
-
-  logic [`BSG_WIDTH(word_width_gp)-1:0] clzh, clzl;
-  wire [`BSG_WIDTH(dword_width_gp)-1:0] clz = !clzh[5] ? clzh : (!opw_v << 5) | clzl;
-  bsg_counting_leading_zeros
-   #(.width_p(word_width_gp))
-   bclzh
-    (.a_i(rs1[word_width_gp+:word_width_gp]), .num_zero_o(clzh));
-
-  bsg_counting_leading_zeros
-   #(.width_p(word_width_gp))
-   bclzl
-    (.a_i(rs1[0+:word_width_gp]), .num_zero_o(clzl));
-
-  logic [num_bytes_lp-1:0][7:0] orcb;
-  for (genvar i = 0; i < num_bytes_lp; i++)
-    begin : rof_orcb
-      assign orcb[i] = {8{|rs1[8*i+:8]}};
-    end
-
-  logic [num_bytes_lp-1:0][7:0] rev8;
-  for (genvar i = 0; i < num_bytes_lp; i++)
-    begin : rof_rev8
-      assign rev8[i] = rs1[(7-i)*8+:8];
-    end
+  wire [rv64_shamt_width_gp-1:0] shamt = word_op ? src2[0+:rv64_shamtw_width_gp] : src2[0+:rv64_shamt_width_gp];
 
   // ALU
   logic [dword_width_gp-1:0] alu_result;
-  wire [lg_bits_lp-1:0] bindex = src2 & shmask;
   always_comb
     unique case (decode.fu_op)
-      // Arithmetic
-      e_int_op_add       : alu_result = sum;
+      e_int_op_add       : alu_result = src1 +  src2;
+      e_int_op_sub       : alu_result = src1 -  src2;
+      e_int_op_xor       : alu_result = src1 ^  src2;
+      e_int_op_or        : alu_result = src1 |  src2;
+      e_int_op_and       : alu_result = src1 &  src2;
+      e_int_op_sll       : alu_result = src1 << shamt;
+      e_int_op_srl       : alu_result = word_op ? $unsigned(src1[0+:word_width_gp]) >>> shamt : $unsigned(src1) >>> shamt;
+      // TODO: not a final solution
+      e_int_op_sra       : alu_result = word_op ? $signed(src1[0+:word_width_gp]) >>> shamt : $signed(src1) >>> shamt;
+      e_int_op_pass_src2 : alu_result = src2;
+      e_int_op_pass_one  : alu_result = 1'b1;
+      e_int_op_pass_zero : alu_result = 1'b0;
 
-      // Logic
-      e_int_op_xor       : alu_result = src1 ^ src2;
-      e_int_op_or        : alu_result = src1 | src2;
-      e_int_op_and       : alu_result = src1 & src2;
-
-      // Bitmanip
-      e_int_op_cpop      : alu_result = popcount;
-      e_int_op_clz       : alu_result = clz;
-      e_int_op_max, e_int_op_maxu, e_int_op_min, e_int_op_minu
-                         : alu_result = comp_result ? rs1 : rs2;
-      e_int_op_orcb      : alu_result = orcb;
-      e_int_op_rev8      : alu_result = rev8;
-
-      // Bit ops
-      e_int_op_bclr      : alu_result = rs1 & ~(1'b1 << bindex);
-      e_int_op_bext      : alu_result = (rs1 >> bindex) & 1'b1;
-      e_int_op_binv      : alu_result = rs1 ^ (1'b1 << bindex);
-      e_int_op_bset      : alu_result = rs1 | (1'b1 << bindex);
-
-      // Comparator
-      default : alu_result = comp_result;
+      // Single bit results
+      e_int_op_eq   : alu_result = (dword_width_gp)'(src1 == src2);
+      e_int_op_ne   : alu_result = (dword_width_gp)'(src1 != src2);
+      e_int_op_slt  : alu_result = (dword_width_gp)'($signed(src1) <  $signed(src2));
+      e_int_op_sltu : alu_result = (dword_width_gp)'(src1 <  src2);
+      e_int_op_sge  : alu_result = (dword_width_gp)'($signed(src1) >= $signed(src2));
+      e_int_op_sgeu : alu_result = (dword_width_gp)'(src1 >= src2);
+      default       : alu_result = '0;
     endcase
 
+
+
+  logic [dword_width_gp-1:0] alu_result22;
+  integer file;
+
+ // Open the file initially
+  initial begin
+    file = $fopen("intOutput.txt", "w");
+    if (file == 0) begin
+      $display("Error: Could not open file.");
+      $finish;
+    end
+  end
+
+  // Write results to the file
+  always_comb begin
+    unique case (decode.fu_op)
+      e_int_op_add: begin
+        alu_result22 = src1 + src2;
+        $fwrite(file, "Time: %0t, Case e_int_op_add satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_sub: begin
+        alu_result22 = src1 - src2;
+        $fwrite(file, "Time: %0t, Case e_int_op_sub satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_xor: begin
+        alu_result22 = src1 ^ src2;
+        $fwrite(file, "Time: %0t, Case e_int_op_xor satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_or: begin
+        alu_result22 = src1 | src2;
+        $fwrite(file, "Time: %0t, Case e_int_op_or satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_and: begin
+        alu_result22 = src1 & src2;
+        $fwrite(file, "Time: %0t, Case e_int_op_and satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_sll: begin
+        alu_result22 = src1 << shamt;
+        $fwrite(file, "Time: %0t, Case e_int_op_sll satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_srl: begin
+        alu_result22 = word_op ? $unsigned(src1[0+:dword_width_gp]) >>> shamt : $unsigned(src1) >>> shamt;
+        $fwrite(file, "Time: %0t, Case e_int_op_srl satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_sra: begin
+        alu_result22 = word_op ? $signed(src1[0+:dword_width_gp]) >>> shamt : $signed(src1) >>> shamt;
+        $fwrite(file, "Time: %0t, Case e_int_op_sra satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_pass_src2: begin
+        alu_result22 = src2;
+        $fwrite(file, "Time: %0t, Case e_int_op_pass_src2 satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_pass_one: begin
+        alu_result22 = 1'b1;
+        $fwrite(file, "Time: %0t, Case e_int_op_pass_one satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_pass_zero: begin
+        alu_result22 = 1'b0;
+        $fwrite(file, "Time: %0t, Case e_int_op_pass_zero satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_eq: begin
+        alu_result22 = (dword_width_gp)'(src1 == src2);
+        $fwrite(file, "Time: %0t, Case e_int_op_eq satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_ne: begin
+        alu_result22 = (dword_width_gp)'(src1 != src2);
+        $fwrite(file, "Time: %0t, Case e_int_op_ne satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_slt: begin
+        alu_result22 = (dword_width_gp)'($signed(src1) < $signed(src2));
+        $fwrite(file, "Time: %0t, Case e_int_op_slt satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_sltu: begin
+        alu_result22 = (dword_width_gp)'(src1 < src2);
+        $fwrite(file, "Time: %0t, Case e_int_op_sltu satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_sge: begin
+        alu_result22 = (dword_width_gp)'($signed(src1) >= $signed(src2));
+        $fwrite(file, "Time: %0t, Case e_int_op_sge satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      e_int_op_sgeu: begin
+        alu_result22 = (dword_width_gp)'(src1 >= src2);
+        $fwrite(file, "Time: %0t, Case e_int_op_sgeu satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+      default: begin
+        alu_result22 = '0;
+        $fwrite(file, "Time: %0t, Default case satisfied: alu_result22 = %0d\n", $time, alu_result22);
+      end
+    endcase
+  end
+
+  // Close the file when the module exits
+  final begin
+    $fclose(file);
+  end
+
+//======================================
+integer file_posedge;
+
+// Open the file initially
+initial begin
+
+  file_posedge = $fopen("intOutput_posedge.txt", "w");
+  if (file_posedge == 0) begin
+    $display("Error: Could not open file.");
+    $finish;
+  end
+end
+
+//====
+
+// Variables to store previous values and operation names
+logic [dword_width_gp-1:0] prev_alu_result_posedge;
+logic [dword_width_gp-1:0] alu_result_posedge;
+string prev_op_name;
+string op_name;
+
+// Initialize previous values
+initial begin
+  prev_alu_result_posedge = '0;
+  prev_op_name = "";
+end
+
+// Write results to the file on the positive edge of the clock
+always_ff @(posedge clk_i) begin
+  unique case (decode.fu_op)
+    e_int_op_add: begin
+      alu_result_posedge = src1 + src2;
+      op_name = "e_int_op_add";
+    end
+    e_int_op_sub: begin
+      alu_result_posedge = src1 - src2;
+      op_name = "e_int_op_sub";
+    end
+    e_int_op_xor: begin
+      alu_result_posedge = src1 ^ src2;
+      op_name = "e_int_op_xor";
+    end
+    e_int_op_or: begin
+      alu_result_posedge = src1 | src2;
+      op_name = "e_int_op_or";
+    end
+    e_int_op_and: begin
+      alu_result_posedge = src1 & src2;
+      op_name = "e_int_op_and";
+    end
+    e_int_op_sll: begin
+      alu_result_posedge = src1 << shamt;
+      op_name = "e_int_op_sll";
+    end
+    e_int_op_srl: begin
+      alu_result_posedge = word_op ? $unsigned(src1[0+:dword_width_gp]) >>> shamt : $unsigned(src1) >>> shamt;
+      op_name = "e_int_op_srl";
+    end
+    e_int_op_sra: begin
+      alu_result_posedge = word_op ? $signed(src1[0+:dword_width_gp]) >>> shamt : $signed(src1) >>> shamt;
+      op_name = "e_int_op_sra";
+    end
+    e_int_op_pass_src2: begin
+      alu_result_posedge = src2;
+      op_name = "e_int_op_pass_src2";
+    end
+    e_int_op_pass_one: begin
+      alu_result_posedge = 1'b1;
+      op_name = "e_int_op_pass_one";
+    end
+    e_int_op_pass_zero: begin
+      alu_result_posedge = 1'b0;
+      op_name = "e_int_op_pass_zero";
+    end
+    e_int_op_eq: begin
+      alu_result_posedge = (dword_width_gp)'(src1 == src2);
+      op_name = "e_int_op_eq";
+    end
+    e_int_op_ne: begin
+      alu_result_posedge = (dword_width_gp)'(src1 != src2);
+      op_name = "e_int_op_ne";
+    end
+    e_int_op_slt: begin
+      alu_result_posedge = (dword_width_gp)'($signed(src1) < $signed(src2));
+      op_name = "e_int_op_slt";
+    end
+    e_int_op_sltu: begin
+      alu_result_posedge = (dword_width_gp)'(src1 < src2);
+      op_name = "e_int_op_sltu";
+    end
+    e_int_op_sge: begin
+      alu_result_posedge = (dword_width_gp)'($signed(src1) >= $signed(src2));
+      op_name = "e_int_op_sge";
+    end
+    e_int_op_sgeu: begin
+      alu_result_posedge = (dword_width_gp)'(src1 >= src2);
+      op_name = "e_int_op_sgeu";
+    end
+    default: begin
+      alu_result_posedge = '0;
+      op_name = "default";
+    end
+  endcase
+
+  // Write to file only if the value or operation name has changed
+  if (alu_result_posedge != prev_alu_result_posedge || op_name != prev_op_name) begin
+    $fwrite(file_posedge, "Time: %0t, Case %s satisfied: alu_result_posedge = %0d\n", $time, op_name, alu_result_posedge);
+    prev_alu_result_posedge = alu_result_posedge;
+    prev_op_name = op_name;
+  end
+end
+
+
+//=====
+
+
+// Close the file when the module exits
+final begin
+  $fclose(file_posedge);
+end
+
+
+
+//======================================
+
+//analyze the code and write out, using $fwrite, 
+//the names of the variables in the code, and their values, 
+//if they are given as the widths and lengths of vectors, 
+//please provide your answer in System Verilog
+//change all instances of file to variable_analysis_file
+
+
+//====================
+
+    integer variable_analysis_file;
+
+  // Open the file initially
+  initial begin
+    variable_analysis_file = $fopen("variable_analysis.txt", "w");
+    if (variable_analysis_file == 0) begin
+      $display("Error: Could not open file.");
+      $finish;
+    end
+
+    // Write variable names and values to the file
+    $fwrite(variable_analysis_file, "Variable Analysis:\n");
+
+    // Inputs
+    $fwrite(variable_analysis_file, "clk_i: %0d\n", clk_i);
+    $fwrite(variable_analysis_file, "reset_i: %0d\n", reset_i);
+    $fwrite(variable_analysis_file, "en_i: %0d\n", en_i);
+    $fwrite(variable_analysis_file, "reservation_i: %0d (width: %0d)\n", reservation_i, reservation_width_lp);
+    $fwrite(variable_analysis_file, "flush_i: %0d\n", flush_i);
+
+    // Outputs
+    $fwrite(variable_analysis_file, "data_o: %0d (width: %0d)\n", data_o, dpath_width_gp);
+    $fwrite(variable_analysis_file, "v_o: %0d\n", v_o);
+    $fwrite(variable_analysis_file, "branch_o: %0d\n", branch_o);
+    $fwrite(variable_analysis_file, "btaken_o: %0d\n", btaken_o);
+    $fwrite(variable_analysis_file, "npc_o: %0d (width: %0d)\n", npc_o, vaddr_width_p);
+    $fwrite(variable_analysis_file, "instr_misaligned_v_o: %0d\n", instr_misaligned_v_o);
+
+    // Internal signals
+    $fwrite(variable_analysis_file, "unused: %0d\n", unused);
+    $fwrite(variable_analysis_file, "reservation: %0d\n", reservation);
+    $fwrite(variable_analysis_file, "decode: %0d\n", decode);
+    $fwrite(variable_analysis_file, "instr: %0d\n", instr);
+    $fwrite(variable_analysis_file, "pc: %0d (width: %0d)\n", pc, vaddr_width_p);
+    $fwrite(variable_analysis_file, "rs1: %0d (width: %0d)\n", rs1, dword_width_gp);
+    $fwrite(variable_analysis_file, "rs2: %0d (width: %0d)\n", rs2, dword_width_gp);
+    $fwrite(variable_analysis_file, "imm: %0d (width: %0d)\n", imm, dword_width_gp);
+    $fwrite(variable_analysis_file, "word_op: %0d\n", word_op);
+    $fwrite(variable_analysis_file, "pc_sext_li: %0d (width: %0d)\n", pc_sext_li, dword_width_gp);
+    $fwrite(variable_analysis_file, "pc_plus4: %0d (width: %0d)\n", pc_plus4, dword_width_gp);
+    $fwrite(variable_analysis_file, "src1: %0d (width: %0d)\n", src1, dword_width_gp);
+    $fwrite(variable_analysis_file, "src2: %0d (width: %0d)\n", src2, dword_width_gp);
+    $fwrite(variable_analysis_file, "shamt: %0d (width: %0d)\n", shamt, rv64_shamt_width_gp);
+    $fwrite(variable_analysis_file, "alu_result: %0d (width: %0d)\n", alu_result, dword_width_gp);
+    $fwrite(variable_analysis_file, "baddr: %0d (width: %0d)\n", baddr, vaddr_width_p);
+    $fwrite(variable_analysis_file, "taken_raw: %0d (width: %0d)\n", taken_raw, vaddr_width_p);
+    $fwrite(variable_analysis_file, "taken_tgt: %0d (width: %0d)\n", taken_tgt, vaddr_width_p);
+    $fwrite(variable_analysis_file, "ntaken_tgt: %0d (width: %0d)\n", ntaken_tgt, vaddr_width_p);
+    $fwrite(variable_analysis_file, "ird_data_lo: %0d (width: %0d)\n", ird_data_lo, dpath_width_gp);
+    $fwrite(variable_analysis_file, "br_result: %0d (width: %0d)\n", br_result, dpath_width_gp);
+    $fwrite(variable_analysis_file, "int_result: %0d (width: %0d)\n", int_result, dword_width_gp);
+
+    // Close the file
+    $fclose(variable_analysis_file);
+  end
+//====================
+
+
+  wire [vaddr_width_p-1:0] baddr = decode.baddr_sel ? rs1 : pc;
+  wire [vaddr_width_p-1:0] taken_raw = baddr + imm;
+  wire [vaddr_width_p-1:0] taken_tgt = {taken_raw[vaddr_width_p-1:1], 1'b0};
+  wire [vaddr_width_p-1:0] ntaken_tgt = pc + (decode.compressed ? 4'd2 : 4'd4);
+
   logic [dpath_width_gp-1:0] ird_data_lo;
+  wire [dpath_width_gp-1:0] br_result = dpath_width_gp'($signed(ntaken_tgt));
+  wire [dword_width_gp-1:0] int_result = decode.branch_v ? br_result : alu_result;
   bp_be_int_box
    #(.bp_params_p(bp_params_p))
    box
-    (.raw_i(alu_result)
-     ,.tag_i(decode.ird_tag)
+    (.raw_i(int_result)
+     ,.tag_i(decode.int_tag)
      ,.unsigned_i(1'b0)
      ,.reg_o(ird_data_lo)
      );
 
-  assign data_o = (decode.j_v | decode.jr_v) ? ntaken_data : ird_data_lo;
+  assign data_o = ird_data_lo;
   assign v_o    = en_i & reservation.v & reservation.decode.pipe_int_v;
 
   assign instr_misaligned_v_o = en_i & btaken_o & (taken_tgt[1:0] != 2'b00) & !compressed_support_p;
 
-  assign branch_o = decode.br_v | decode.j_v | decode.jr_v;
-  assign btaken_o = (decode.br_v & comp_result) || decode.j_v || decode.jr_v;
+  assign branch_o = decode.branch_v;
+  assign btaken_o = decode.branch_v & (decode.jump_v | alu_result[0]);
   assign npc_o = btaken_o ? taken_tgt : ntaken_tgt;
+
+
+// //analyze the code and write out, using $fwrite, 
+// //the names of the variables in the code, and their values, 
+// //if they are given as the widths and lengths of vectors, 
+// //please provide your answer in System Verilog
+// //change all instances of file to variable_analysis_file
+// 
+// 
+// These instructions are part of the pipeline control logic for handling branch instructions and updating the program counter in the RISC-V integer pipeline. Here's a breakdown of their use:
+// Branch Address Calculation:
+//    wire [vaddr_width_p-1:0] baddr = decode.baddr_sel ? rs1 : pc;
+// 
+// 
+//  - `baddr` is the base address for the branch calculation. It is either the value of `rs1` (source register 1) or the program counter (`pc`), depending on the `baddr_sel` signal from the decode stage.2. **Target Address Calculation**:
+//    wire [vaddr_width_p-1:0] taken_raw = baddr + imm;
+//    wire [vaddr_width_p-1:0] taken_tgt = {taken_raw[vaddr_width_p-1:1], 1'b0};
+// 
+// 
+//  - `taken_raw` is the raw target address for the branch, calculated by adding the immediate value (`imm`) to the base address (`baddr`). - `taken_tgt` is the aligned target address, ensuring that the least significant bit is zero (since instructions are word-aligned).3. **Next Program Counter Calculation**:
+//    wire [vaddr_width_p-1:0] ntaken_tgt = pc + (decode.compressed ? 4'd2 : 4'd4);
+// 
+// 
+//  - `ntaken_tgt` is the next program counter value if the branch is not taken. It increments the program counter by 2 if the instruction is compressed, otherwise by 4.4. **Intermediate Data and Result Calculation**:
+//    logic [dpath_width_gp-1:0] ird_data_lo;
+//    wire [dpath_width_gp-1:0] br_result = dpath_width_gp'($signed(ntaken_tgt));
+//    wire [dword_width_gp-1:0] int_result = decode.branch_v ? br_result : alu_result;
+// 
+// 
+//  - `br_result` is the result of the branch calculation, sign-extended to the data path 
+// width. - `int_result` is the final result, which is either the branch result (`br_result`) 
+// if a branch is valid, or the ALU result (`alu_result`).5. **Box Module**:
+//    bp_be_int_box
+//     #(.bp_params_p(bp_params_p))
+//     box
+//      (.raw_i(int_result)
+//       ,.tag_i(decode.int_tag)
+//       ,.unsigned_i(1'b0)
+//       ,.reg_o(ird_data_lo)
+//       );
+// 
+// 
+//  - This instantiates a module `bp_be_int_box` that processes the integer result (`int_result`) 
+// and outputs the processed data (`ird_data_lo`).6. **Output Assignments**:
+//    assign data_o = ird_data_lo;
+//    assign v_o    = en_i & reservation.v & reservation.decode.pipe_int_v;
+//    assign instr_misaligned_v_o = en_i & btaken_o & (taken_tgt[1:0] != 2'b00) & !compressed_support_p;
+//    assign branch_o = decode.branch_v;
+//    assign btaken_o = decode.branch_v & (decode.jump_v | alu_result[0]);
+//    assign npc_o = btaken_o ? taken_tgt : ntaken_tgt;
+// 
+// 
+//  - `data_o` is assigned the processed data from `ird_data_lo`. - `v_o` indicates 
+// if the pipeline stage is valid. - `instr_misaligned_v_o` indicates 
+// if the instruction is misaligned. - `branch_o` indicates if a branch
+//  is valid. - `btaken_o` indicates if the branch is taken. - `npc_o` 
+// is the next program counter value, either the taken target (`taken_tgt`) 
+// or the not-taken target (`ntaken_tgt`).These instructions collectively manage 
+// the control flow for branch instructions, ensuring the correct program counter 
+// updates and handling of branch targets in the pipeline. 
+// If you have any further questions or need more details, feel free to ask!
+
+
 
 endmodule
 
