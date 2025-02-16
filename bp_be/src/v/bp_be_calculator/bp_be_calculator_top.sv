@@ -1,16 +1,5 @@
-/**
- *
- * Name:
- *   bp_be_calculator_top.v
- *
- * Description:
- *
- * Notes:
- *   Should subdivide this module into a few helper modules to reduce complexity. Perhaps
- *     issuer, exe_pipe, completion_pipe, status_gen?
- *   Exception aggregation could be simplified with constants and more thought. Should fix
- *     once code is more stable, fixing in cleanup could cause regressions
- */
+// splitHere
+
 
 `include "bp_common_defines.svh"
 `include "bp_be_defines.svh"
@@ -21,11 +10,16 @@ module bp_be_calculator_top
  #(parameter bp_params_e bp_params_p = e_bp_default_cfg
     `declare_bp_proc_params(bp_params_p)
     `declare_bp_core_if_widths(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p)
-    `declare_bp_be_if_widths(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p, fetch_ptr_p, issue_ptr_p)
     `declare_bp_be_dcache_engine_if_widths(paddr_width_p, dcache_tag_width_p, dcache_sets_p, dcache_assoc_p, dword_width_gp, dcache_block_width_p, dcache_fill_width_p, dcache_req_id_width_p)
 
    // Generated parameters
    , localparam cfg_bus_width_lp        = `bp_cfg_bus_width(vaddr_width_p, hio_width_p, core_id_width_p, cce_id_width_p, lce_id_width_p, did_width_p)
+   , localparam dispatch_pkt_width_lp   = `bp_be_dispatch_pkt_width(vaddr_width_p)
+   , localparam branch_pkt_width_lp     = `bp_be_branch_pkt_width(vaddr_width_p)
+   , localparam commit_pkt_width_lp     = `bp_be_commit_pkt_width(vaddr_width_p, paddr_width_p)
+   , localparam wb_pkt_width_lp         = `bp_be_wb_pkt_width(vaddr_width_p)
+   , localparam decode_info_width_lp    = `bp_be_decode_info_width
+   , localparam trans_info_width_lp     = `bp_be_trans_info_width(ptag_width_p)
    )
   (input                                             clk_i
    , input                                           reset_i
@@ -89,9 +83,13 @@ module bp_be_calculator_top
    , output logic [dcache_stat_info_width_lp-1:0]    stat_mem_o
    );
 
+
+// splitHere
+
+
   // Declare parameterizable structs
   `declare_bp_cfg_bus_s(vaddr_width_p, hio_width_p, core_id_width_p, cce_id_width_p, lce_id_width_p, did_width_p);
-  `declare_bp_be_if(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p, fetch_ptr_p, issue_ptr_p);
+  `declare_bp_be_internal_if_structs(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p);
 
   `bp_cast_i(bp_be_dispatch_pkt_s, dispatch_pkt);
   `bp_cast_o(bp_be_commit_pkt_s, commit_pkt);
@@ -136,6 +134,10 @@ module bp_be_calculator_top
   bp_be_wb_pkt_s pipe_mem_late_wb_pkt;
   logic pipe_mem_late_wb_v, pipe_mem_late_wb_yumi;
 
+
+// splitHere
+
+
   // Generating match vector for bypass
   logic [2:0][pipe_stage_els_lp-1:0] match_rs;
   logic [pipe_stage_els_lp-1:0][dpath_width_gp-1:0] forward_data;
@@ -148,7 +150,136 @@ module bp_be_calculator_top
       assign match_rs[2][i] = (dispatch_pkt_cast_i.decode.frs3_r_v & comp_stage_r[i].frd_w_v & (dispatch_pkt_cast_i.instr.t.fmatype.rs3_addr == comp_stage_r[i].rd_addr));
 
       assign forward_data[i] = comp_stage_n[i+1].rd_data;
+
     end
+
+  for (genvar i = 0; i < pipe_stage_els_lp; i++)
+    begin : forward_match22
+    // Print the forward_data values
+    // $write("forward_data[%0d]: %0d\n", i, forward_data[i]);
+    // dispatch_pkt_r.instr
+    // input [dispatch_pkt_width_lp-1:0]  dispatch_pkt_i
+    end
+
+always_comb begin
+    for (integer i = 0; i < pipe_stage_els_lp; i++) begin
+        bit has_data = 0;
+        for (integer j = 0; j < dpath_width_gp; j++) begin
+            if (forward_data[i][j] > 0) begin
+                has_data = 1;
+                break;
+            end
+        end
+
+        //if (has_data) begin
+        //    $write("forward_data[%0d]: ", i);
+        //    for (integer j = 0; j < dpath_width_gp; j++) begin
+        //        $write("%0d ", forward_data[i][j]);
+        //    end
+        //    $write("\n"); // Advance to the next line after printing the entire row
+        //end
+    end
+end
+
+//=====================================
+
+  // Top-level interface connections
+
+  // bp_be_dispatch_pkt_s dispatch_pkt;
+  // that's it - but you need a decoded version
+
+  //  typedef struct packed       
+  //  {                                               
+  //    logic                                    v;    
+  //    logic                                    queue_v;           
+  //    logic                                    instr_v;         
+  //    logic                                    ispec_v;      
+  //    logic                                    nspec_v;      
+  //    logic [vaddr_width_mp-1:0]               pc;          
+  //    rv64_instr_s                             instr;       
+  //    logic                                    partial;     
+  //    bp_be_decode_s                           decode;      
+                                                             
+  //    logic [dpath_width_gp-1:0]               rs1;           
+  //    logic [dpath_width_gp-1:0]               rs2;      
+  //    logic [dpath_width_gp-1:0]               imm;        
+  //    bp_be_exception_s                        exception;     
+  //    bp_be_special_s                          special;     
+  //  }  bp_be_dispatch_pkt_s;   
+
+  //taken from bp_be_instr_decoder.sv line ~50
+  //easy error
+
+  rv64_instr_fmatype_s instr;
+  
+  // assign instr = dispatch_pkt_i.instr;
+  // taken from bp_be_pipe_int.sv
+  // bp_be_reservation_s reservation;
+  // bp_be_decode_s decode;
+  // rv64_instr_s instr;
+
+
+
+ integer file;
+ bit stop_output;
+
+  // Open the file initially
+  initial begin
+    file = $fopen("calcOutput.txt", "w");
+    if (file == 0) begin
+      $display("Error: Could not open file.");
+      $finish;
+    end
+    stop_output = 0;
+  end
+
+
+  // Write data to the file
+  always_comb begin
+    if ($time > 100000) begin
+      stop_output = 1;
+    end
+
+    if (!stop_output) begin
+      // Check if dispatch_pkt_i is non-zero
+      if (|dispatch_pkt_i) begin
+        $fwrite(file, "Time: %0t, dispatch_pkt_i: ", $time);
+        for (integer k = 0; k < dispatch_pkt_width_lp; k++) begin
+          $fwrite(file, "%0d", dispatch_pkt_i[k]);
+        end
+        $fwrite(file, "\n"); // Advance to the next line after printing the entire signal
+      end
+
+      // Check and print forward_data if non-zero
+      for (integer i = 0; i < pipe_stage_els_lp; i++) begin
+        bit has_data = 0;
+        for (integer j = 0; j < dpath_width_gp; j++) begin
+          if (forward_data[i][j] > 0) begin
+            has_data = 1;
+            break;
+          end
+        end
+
+        if (has_data) begin
+          $fwrite(file, "Time: %0t, forward_data[%0d]: ", $time, i);
+          for (integer j = 0; j < dpath_width_gp; j++) begin
+            $fwrite(file, "%0d ", forward_data[i][j]);
+          end
+          $fwrite(file, "\n"); // Advance to the next line after printing the entire row
+        end
+      end
+    end
+  end
+
+  // Close the file when the module exits
+  final begin
+    $fclose(file);
+  end
+
+//=====================================
+
+
+// splitHere
 
   logic [2:0][dpath_width_gp-1:0] bypass_rs;
   wire [2:0][dpath_width_gp-1:0] dispatch_data = {dispatch_pkt_cast_i.imm, dispatch_pkt_cast_i.rs2, dispatch_pkt_cast_i.rs1};
@@ -163,6 +294,10 @@ module bp_be_calculator_top
          ,.v_o()
          );
 
+
+// splitHere
+
+
       bsg_mux_one_hot
        #(.width_p(dpath_width_gp), .els_p(pipe_stage_els_lp+1))
        fwd_mux_oh
@@ -171,6 +306,9 @@ module bp_be_calculator_top
          ,.data_o(bypass_rs[i])
          );
     end
+
+
+// splitHere
 
   bp_be_reservation_s reservation_r;
   bp_be_reservation
@@ -183,6 +321,10 @@ module bp_be_calculator_top
      ,.bypass_rs_i(bypass_rs)
      ,.reservation_o(reservation_r)
      );
+
+
+// splitHere
+
 
   // Computation pipelines
   // System pipe: 1 cycle latency
@@ -198,6 +340,7 @@ module bp_be_calculator_top
 
      ,.retire_v_i(exc_stage_r[2].v)
      ,.retire_queue_v_i(exc_stage_r[2].queue_v)
+     ,.retire_partial_v_i(exc_stage_r[2].partial_v)
      ,.retire_data_i(comp_stage_r[2].rd_data)
      ,.retire_exception_i(exc_stage_r[2].exc)
      ,.retire_special_i(exc_stage_r[2].spec)
@@ -222,6 +365,10 @@ module bp_be_calculator_top
      ,.frm_dyn_o(frm_dyn_lo)
      );
 
+
+// splitHere
+
+
   // Integer pipe: 1 cycle latency
   bp_be_pipe_int
    #(.bp_params_p(bp_params_p))
@@ -241,32 +388,39 @@ module bp_be_calculator_top
      ,.instr_misaligned_v_o(pipe_int_early_instr_misaligned_lo)
      );
 
-  assign br_pkt_cast_o.v      = exc_stage_r[0].v & exc_stage_r[0].queue_v;
+
+// splitHere
+
+  assign br_pkt_cast_o.v      = exc_stage_r[0].v & exc_stage_r[0].queue_v & ~commit_pkt_cast_o.npc_w_v;
   assign br_pkt_cast_o.branch = br_pkt_cast_o.v & pipe_int_early_branch_lo;
   assign br_pkt_cast_o.btaken = br_pkt_cast_o.v & pipe_int_early_btaken_lo;
   assign br_pkt_cast_o.bspec  = br_pkt_cast_o.v & exc_stage_r[0].ispec_v;
   assign br_pkt_cast_o.npc    = pipe_int_early_npc_lo;
 
+
+// splitHere
+
+
   logic [dword_width_gp-1:0] rs2_val_r;
   if (integer_support_p[e_catchup])
     begin : catchup
-      logic [int_rec_width_gp-1:0] catchup_bypass_src1;
+      logic [dword_width_gp-1:0] catchup_bypass_src1;
       bp_be_int_unbox
        #(.bp_params_p(bp_params_p))
        irs1_unbox
         (.reg_i(comp_stage_n[2].rd_data)
-         ,.tag_i(reservation_r.decode.irs1_tag)
-         ,.unsigned_i(reservation_r.decode.irs1_unsigned)
+         ,.tag_i(reservation_r.decode.int_tag)
+         ,.unsigned_i(reservation_r.decode.rs1_unsigned)
          ,.val_o(catchup_bypass_src1)
          );
 
-      logic [int_rec_width_gp-1:0] catchup_bypass_src2;
+      logic [dword_width_gp-1:0] catchup_bypass_src2;
       bp_be_int_unbox
        #(.bp_params_p(bp_params_p))
        irs2_unbox
         (.reg_i(comp_stage_n[2].rd_data)
-         ,.tag_i(reservation_r.decode.irs2_tag)
-         ,.unsigned_i(reservation_r.decode.irs2_unsigned)
+         ,.tag_i(reservation_r.decode.int_tag)
+         ,.unsigned_i(reservation_r.decode.rs2_unsigned)
          ,.val_o(catchup_bypass_src2)
          );
 
@@ -280,6 +434,9 @@ module bp_be_calculator_top
             catchup_reservation_n.isrc2 = catchup_bypass_src2;
         end
 
+// splitHere
+
+
       bsg_dff
        #(.width_p($bits(bp_be_reservation_s)))
        catchup_reservation_reg
@@ -287,6 +444,10 @@ module bp_be_calculator_top
          ,.data_i(catchup_reservation_n)
          ,.data_o(catchup_reservation_r)
          );
+
+
+// splitHere
+
 
       // Catchup integer pipe: 1 cycle latency, starts at EX2
       bp_be_pipe_int
@@ -309,7 +470,7 @@ module bp_be_calculator_top
       assign pipe_int_catchup_mispredict_lo = exc_stage_r[1].ispec_v & (pipe_int_catchup_npc_lo != reservation_r.pc);
 
       assign rs2_val_r =
-        catchup_reservation_r.decode.irs2_r_v ? catchup_reservation_r.isrc2 : catchup_reservation_r.fsrc2;
+        catchup_reservation_r.decode.irs2_r_v ? catchup_reservation_r.isrc2 : catchup_reservation_r.fsrc2;;
     end
   else
     begin : no_catchup
@@ -329,6 +490,10 @@ module bp_be_calculator_top
          );
     end
 
+// splitHere
+
+
+
   // Aux pipe: 2 cycle latency
   bp_be_pipe_aux
    #(.bp_params_p(bp_params_p))
@@ -344,6 +509,23 @@ module bp_be_calculator_top
      ,.fflags_o(pipe_aux_fflags_lo)
      ,.v_o(pipe_aux_data_v_lo)
      );
+
+// Sure, let's break down the purpose of each port in the bp_be_pipe_aux module:
+// `.clk_i(clk_i)`: This is the clock input signal. It synchronizes the operations of the module with the system clock.
+// `.reset_i(reset_i)`: This is the reset input signal. It initializes or resets the state of the module when asserted.
+// `.reservation_i(reservation_r)`: This input signal likely carries reservation information, which could be used for managing resources or scheduling within the pipeline.
+// `.flush_i(commit_pkt_cast_o.npc_w_v)`: This input signal is used to flush the pipeline. When asserted, it clears or invalidates the current operations in the pipeline, typically in response to a misprediction or an exception.
+// `.frm_dyn_i(frm_dyn_lo)`: This input signal carries dynamic form data, which could be configuration or control information that changes dynamically during operation.
+// `.data_o(pipe_aux_data_lo)`: This is the data output signal. It carries the processed data from the auxiliary pipeline to the next stage or module.
+// `.fflags_o(pipe_aux_fflags_lo)`: This output signal carries flags, which could be status or condition flags resulting from the pipeline's operations (e.g., overflow, underflow, etc.).
+// `.v_o(pipe_aux_data_v_lo)`: This is the valid output signal. It indicates whether the data output (`data_o`) is valid and can be used by the next stage or module.
+// Each of these ports plays a specific role in the operation and control of the bp_be_pipe_aux module, ensuring proper data flow, synchronization, and control within the pipeline.
+// If you have any more questions or need further details, feel free to ask!
+
+
+// splitHere
+
+
 
   // Memory pipe: 2/3 cycle latency
   bp_be_pipe_mem
@@ -415,6 +597,9 @@ module bp_be_calculator_top
      ,.trans_info_i(trans_info_o)
      );
 
+
+// splitHere
+
   // Floating point pipe: 3/4 cycle latency
   bp_be_pipe_fma
    #(.bp_params_p(bp_params_p))
@@ -432,6 +617,9 @@ module bp_be_calculator_top
      ,.fma_fflags_o(pipe_fma_fflags_lo)
      ,.fma_v_o(pipe_fma_data_v_lo)
      );
+
+
+// splitHere
 
   // Variable length pipeline, used for long (potentially scoreboarded operations)
   bp_be_pipe_long
@@ -455,6 +643,9 @@ module bp_be_calculator_top
      ,.fwb_yumi_i(pipe_long_fdata_yumi_lo)
      );
 
+// splitHere
+
+
   localparam num_late_wb_lp = 3;
   logic [num_late_wb_lp-1:0] late_wb_reqs_li, late_wb_grants_lo;
   assign {pipe_long_fdata_yumi_lo, pipe_long_idata_yumi_lo, pipe_mem_late_wb_yumi} =
@@ -468,6 +659,9 @@ module bp_be_calculator_top
      ,.grants_o(late_wb_grants_lo)
      );
 
+
+// splitHere
+
   bp_be_wb_pkt_s late_wb_pkt_sel;
   wire [num_late_wb_lp-1:0][$bits(bp_be_wb_pkt_s)-1:0] late_wb_pkts_li =
     {pipe_long_fwb_pkt, pipe_long_iwb_pkt, pipe_mem_late_wb_pkt};
@@ -478,6 +672,9 @@ module bp_be_calculator_top
      ,.sel_one_hot_i(late_wb_grants_lo)
      ,.data_o(late_wb_pkt_sel)
      );
+
+
+// splitHere
 
   assign late_wb_pkt_cast_o = late_wb_pkt_sel;
   assign late_wb_v_o = |late_wb_grants_lo;
@@ -538,6 +735,9 @@ module bp_be_calculator_top
       comp_stage_n[3].frd_w_v    &= ~commit_pkt_cast_o.fscore_v;
     end
 
+// splitHere
+
+
   bsg_dff
    #(.width_p($bits(bp_be_wb_pkt_s)*pipe_stage_els_lp))
    comp_stage_reg
@@ -547,6 +747,10 @@ module bp_be_calculator_top
      );
   assign iwb_pkt_cast_o = comp_stage_r[3];
   assign fwb_pkt_cast_o = comp_stage_r[4];
+
+
+// splitHere
+
 
   always_comb
     begin
@@ -560,6 +764,7 @@ module bp_be_calculator_top
           exc_stage_n[0].queue_v                  |= dispatch_pkt_cast_i.queue_v;
           exc_stage_n[0].ispec_v                  |= dispatch_pkt_cast_i.ispec_v;
           exc_stage_n[0].nspec_v                  |= dispatch_pkt_cast_i.nspec_v;
+          exc_stage_n[0].partial_v                |= dispatch_pkt_cast_i.partial;
           exc_stage_n[0].spec                     |= dispatch_pkt_cast_i.special;
           exc_stage_n[0].exc                      |= dispatch_pkt_cast_i.exception;
 
@@ -592,6 +797,38 @@ module bp_be_calculator_top
           exc_stage_n[2].spec.dcache_miss         |= pipe_mem_dcache_miss_lo;
           exc_stage_n[2].exc.cmd_full             |= |{exc_stage_r[2].exc, exc_stage_r[2].spec} & cmd_full_n_i;
     end
+
+
+// Yes, I understand this code snippet. It appears to be written in SystemVerilog, a hardware description language used for designing and modeling electronic systems. Here's a breakdown of what each part does:
+// Overview
+// always_comb: This block is used to describe combinational logic. It is executed whenever any of the signals in the block change.
+// Exception Aggregation: The code is aggregating exceptions through a pipeline.
+// Detailed Breakdown
+// For Loop:
+// The for loop iterates from 0 to pipe_stage_els_lp.
+// For each stage, it shifts the exception stage down the pipeline.
+// exc_stage_n[i] = (i == 0) ? '0 : exc_stage_r[i-1]; initializes the first stage to zero and shifts the rest from the previous stage.
+// Exception Handling:
+// The first stage (`exc_stage_n[0]`) is updated with various signals from dispatch_pkt_cast_i.
+// The valid signal (`v`) is updated based on the commit_pkt_cast_o.npc_w_v signal and other conditions.
+// Queue valid (`queue_v`), instruction spec valid (`ispec_v`), non-spec valid (`nspec_v`), partial valid (`partial_v`), special (`spec`), and exception (`exc`) signals are updated accordingly.
+// Pipeline Stages:
+// The valid signal for subsequent stages (`exc_stage_n[1]`, exc_stage_n[2], exc_stage_n[3]) is updated based on the commit_pkt_cast_o.npc_w_v signal and the non-spec valid signal from the previous stage.
+// Queue valid signals for stages 1 and 2 are updated similarly.
+// Exception Signals:
+// Various exception signals (`illegal_instr`, instr_misaligned, dtlb_store_miss, dtlb_load_miss, etc.) are updated based on corresponding pipeline signals.
+// Special Cases:
+// Specific exceptions like dcache_replay, dcache_miss, and cmd_full are updated based on pipeline signals.
+// This code is managing the propagation and handling of exceptions through a pipeline, ensuring that the correct signals are updated at each stage.
+// If you have any specific questions about this code or need further explanation, feel free to ask!
+
+
+
+
+
+
+// splitHere
+
 
   // Exception pipeline
   bsg_dff
