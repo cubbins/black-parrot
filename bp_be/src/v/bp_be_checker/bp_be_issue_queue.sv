@@ -8,23 +8,21 @@ module bp_be_issue_queue
  #(parameter bp_params_e bp_params_p = e_bp_default_cfg
    `declare_bp_proc_params(bp_params_p)
    `declare_bp_core_if_widths(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p)
-   `declare_bp_be_if_widths(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p, fetch_ptr_p, issue_ptr_p)
 
-   , localparam entry_cinstr_gp = 2**fetch_sel_p
-   , localparam op_ptr_width_lp = `BSG_WIDTH(entry_cinstr_gp)
+   , localparam decode_info_width_lp = `bp_be_decode_info_width
+   , localparam preissue_pkt_width_lp = `bp_be_preissue_pkt_width
+   , localparam issue_pkt_width_lp = `bp_be_issue_pkt_width(vaddr_width_p, branch_metadata_fwd_width_p)
    )
   (input                                       clk_i
    , input                                     reset_i
 
-   , input                                     en_i
-   , input                                     clr_i
-   , input                                     roll_i
-   , input                                     read_i
-   , input [op_ptr_width_lp-1:0]               read_cnt_i
-   , input [op_ptr_width_lp-1:0]               read_size_i
-   , input                                     cmt_i
-   , input [op_ptr_width_lp-1:0]               cmt_cnt_i
-   , input [op_ptr_width_lp-1:0]               cmt_size_i
+   , input                                     clr_v_i
+   , input                                     deq_v_i
+   , input                                     deq_skip_i
+   , input                                     roll_v_i
+   , input                                     suppress_v_i
+   , input                                     read_v_i
+   , input                                     read_skip_i
 
    , input [fe_queue_width_lp-1:0]             fe_queue_i
    , input                                     fe_queue_v_i
@@ -36,49 +34,56 @@ module bp_be_issue_queue
    );
 
   `declare_bp_core_if(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p);
-  `declare_bp_be_if(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p, fetch_ptr_p, issue_ptr_p);
+  `declare_bp_be_internal_if_structs(vaddr_width_p, paddr_width_p, asid_width_p, branch_metadata_fwd_width_p);
   `bp_cast_i(bp_fe_queue_s, fe_queue);
   `bp_cast_o(bp_be_preissue_pkt_s, preissue_pkt);
   `bp_cast_o(bp_be_issue_pkt_s, issue_pkt);
 
-  localparam entry_ptr_width_lp = fetch_sel_p;
-  localparam mem_ptr_width_lp = `BSG_SAFE_CLOG2(fe_queue_fifo_els_p);
-  localparam ptr_width_lp = mem_ptr_width_lp+entry_ptr_width_lp+1;
+  localparam ptr_width_lp = `BSG_SAFE_CLOG2(fe_queue_fifo_els_p);
+  localparam ptr_wrap_bit_lp = ptr_width_lp + compressed_support_p;
+  localparam ptr_base_bit_lp = compressed_support_p;
 
-  localparam ptr_wrap_bit_lp = ptr_width_lp-1;
-  localparam ptr_base_bit_lp = entry_ptr_width_lp;
-  localparam ptr_slots_lp = 1 << ptr_width_lp;
+  localparam ptr_slots_lp = compressed_support_p ? 4*fe_queue_fifo_els_p : 2*fe_queue_fifo_els_p;
 
   // One read pointer, one write pointer, one checkpoint pointer
-  struct packed
-  {
-    logic                          wrap;
-    logic [mem_ptr_width_lp-1:0]   mem;
-    logic [entry_ptr_width_lp-1:0] entry;
-  } wptr_n, wptr_r, rptr_n, rptr_r, cptr_n, cptr_r;
+  logic [ptr_wrap_bit_lp:0] wptr_n, rptr_n, cptr_n;
+  logic [ptr_wrap_bit_lp:0] wptr_r, rptr_r, cptr_r;
 
-  // Status
-  wire ack     = (fe_queue_ready_and_o & fe_queue_v_i);
-  wire empty   = (rptr_r == wptr_r);
-  wire empty_n = (rptr_n == wptr_n);
-  wire full    = (cptr_r.mem == wptr_r.mem) && (cptr_r.wrap != wptr_r.wrap);
-  wire full_n  = (cptr_n.mem == wptr_n.mem) && (cptr_n.wrap != wptr_n.wrap);
+  // Ops
+  logic [compressed_support_p:0] enq, deq, read;
+  // Used to catch up on roll and clear operations
+  logic [ptr_wrap_bit_lp:0] wptr_jmp, rptr_jmp, cptr_jmp;
 
   // Operations
-  logic [op_ptr_width_lp-1:0] enq, deq, read;
-  wire enq_catchup  = 1'b1; // Enqueue always allocates a new queue entry
-  wire read_catchup = (rptr_r.entry + read_size_i >= read_cnt_i);
-  wire deq_catchup  = (cptr_r.entry + cmt_size_i  >= cmt_cnt_i );
+  wire suppress = suppress_v_i;
+  wire clr      = clr_v_i;
+  wire roll     = roll_v_i;
+  wire ack      = fe_queue_ready_and_o & fe_queue_v_i;
 
-  assign enq  = ack    ? enq_catchup  ? (entry_cinstr_gp - wptr_r.entry) : '0          : '0;
-  assign read = read_i ? read_catchup ? (entry_cinstr_gp - rptr_r.entry) : read_size_i : '0;
-  assign deq  = cmt_i  ? deq_catchup  ? (entry_cinstr_gp - cptr_r.entry) : cmt_size_i  : '0;
+  if (compressed_support_p)
+    begin : c0
+      assign enq = ack ? 2'b10 : 2'b00;
+      assign deq = deq_v_i ? deq_skip_i ? 2'b10 : 2'b01 : 2'b00;
+      assign read = read_v_i ? read_skip_i ? 2'b10 : 2'b01 : 2'b00;
+    end
+  else
+    begin : nc0
+      assign enq = ack ? 1'b1 : 1'b0;
+      assign deq = deq_v_i ? 1'b1 : 1'b0;
+      assign read = read_v_i ? 1'b1 : 1'b0;
+    end
+  assign rptr_jmp = clr ? -rptr_r : roll ? (cptr_r - rptr_r + deq) : read;
+  assign wptr_jmp = clr ? -wptr_r : enq;
+  assign cptr_jmp = clr ? -cptr_r : deq;
 
-  // Calculate next pointer jump
-  logic [ptr_width_lp-1:0] wptr_jmp, rptr_jmp, cptr_jmp;
-  assign rptr_jmp = clr_i ? -rptr_r : roll_i ? (cptr_r - rptr_r + deq) : read;
-  assign wptr_jmp = clr_i ? -wptr_r : enq;
-  assign cptr_jmp = clr_i ? -cptr_r : deq;
+  wire empty   = (rptr_r[ptr_wrap_bit_lp-1:0] == wptr_r[ptr_wrap_bit_lp-1:0])
+                 & (rptr_r[ptr_wrap_bit_lp] == wptr_r[ptr_wrap_bit_lp]);
+  wire empty_n = (rptr_n[ptr_wrap_bit_lp-1:0] == wptr_n[ptr_wrap_bit_lp-1:0])
+                 & (rptr_n[ptr_wrap_bit_lp] == wptr_n[ptr_wrap_bit_lp]);
+  wire full    = (cptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp] == wptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp])
+                 & (cptr_r[ptr_wrap_bit_lp] != wptr_r[ptr_wrap_bit_lp]);
+  wire full_n  = (cptr_n[ptr_wrap_bit_lp-1:ptr_base_bit_lp] == wptr_n[ptr_wrap_bit_lp-1:ptr_base_bit_lp])
+                 & (cptr_n[ptr_wrap_bit_lp] != wptr_n[ptr_wrap_bit_lp]);
 
   bsg_circular_ptr
    #(.slots_p(ptr_slots_lp), .max_add_p(ptr_slots_lp-1))
@@ -110,52 +115,56 @@ module bp_be_issue_queue
      ,.n_o(rptr_n)
      );
 
-  logic [fetch_width_p-1:0] queue_instr, queue_instr_n;
+  rv64_instr_fmatype_s queue_instr;
   assign queue_instr = fe_queue_cast_i.instr;
-  wire preissue_v = (|read & ~empty_n) | roll_i | (|enq & empty);
+  wire preissue_v = (|read & ~empty_n) | roll | (|enq & empty);
+  rv64_instr_fmatype_s queue_instr_n, preissue_instr_raw;
   wire bypass_preissue = (wptr_r == rptr_n);
   bsg_mem_1r1w
-   #(.width_p(fetch_width_p), .els_p(fe_queue_fifo_els_p))
+   #(.width_p(instr_width_gp), .els_p(fe_queue_fifo_els_p))
    preissue_fifo_mem
     (.w_clk_i(clk_i)
      ,.w_reset_i(reset_i)
      ,.w_v_i(|enq)
-     ,.w_addr_i(wptr_r.mem)
+     ,.w_addr_i(wptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp])
      ,.w_data_i(queue_instr)
-     ,.r_v_i(~bypass_preissue)
-     ,.r_addr_i(rptr_n.mem)
+     ,.r_v_i(preissue_v & ~bypass_preissue)
+     ,.r_addr_i(rptr_n[ptr_wrap_bit_lp-1:ptr_base_bit_lp])
      ,.r_data_o(queue_instr_n)
      );
+  assign preissue_instr_raw = bypass_preissue ? queue_instr : queue_instr_n;
 
-  wire [entry_ptr_width_lp-1:0] preissue_entry_sel = bypass_preissue ? wptr_r.entry : rptr_n.entry;
-  logic [fetch_cinstr_p:0][cinstr_width_gp-1:0] queue_instr_raw;
-  assign queue_instr_raw[0+:fetch_cinstr_p] = bypass_preissue ? queue_instr : queue_instr_n;
-  assign queue_instr_raw[fetch_cinstr_p] = '0;
-
-  rv64_instr_s [fetch_cinstr_p-1:0] preissue_instr;
-  logic [fetch_cinstr_p-1:0][fetch_ptr_p-1:0] preissue_size;
-  for (genvar i = 0; i < fetch_cinstr_p; i++)
-    begin : e
-      logic [instr_width_gp-1:0] instr;
-      wire [cinstr_width_gp-1:0] cinstr = queue_instr_raw[i];
+  rv64_instr_s preissue_instr;
+  logic preissue_compressed;
+  if (compressed_support_p)
+    begin : c1
+      rv64_instr_s preissue_instr_expanded;
+      wire upper_n = compressed_support_p & rptr_n[0];
+      wire [cinstr_width_gp-1:0] preissue_cinstr =
+        upper_n ? preissue_instr_raw[cinstr_width_gp+:cinstr_width_gp] : preissue_instr_raw[0+:cinstr_width_gp];
       bp_be_expander
        expander
-        (.cinstr_i(cinstr)
-         ,.instr_o(instr)
+        (.cinstr_i(preissue_cinstr)
+         ,.instr_o(preissue_instr_expanded)
          );
-      assign preissue_size[i] = ~&cinstr[0+:2] ? 2'b01 : 2'b10;
-      assign preissue_instr[i] = (preissue_size[i] == 2'b01) ? instr : queue_instr_raw[i+:2];
+      assign preissue_compressed = ~&preissue_cinstr[0+:2];
+      assign preissue_instr = preissue_compressed ? preissue_instr_expanded : preissue_instr_raw;
+    end
+  else
+    begin : nc1
+      assign preissue_instr =  preissue_instr_raw;
+      assign preissue_compressed = '0;
     end
 
   // Pre-decode
   always_comb
     begin
       preissue_pkt_cast_o = '0;
-      preissue_pkt_cast_o.size = preissue_size[preissue_entry_sel];
-      preissue_pkt_cast_o.instr = preissue_instr[preissue_entry_sel];
+      preissue_pkt_cast_o.compressed = preissue_compressed;
+      preissue_pkt_cast_o.instr = preissue_instr;
 
       // Decide whether to read from regfile
-      casez (preissue_instr[preissue_entry_sel].t.fmatype.opcode)
+      casez (preissue_pkt_cast_o.instr.t.fmatype.opcode)
         `RV64_JALR_OP, `RV64_LOAD_OP, `RV64_OP_IMM_OP, `RV64_OP_IMM_32_OP, `RV64_SYSTEM_OP :
           begin
             preissue_pkt_cast_o.irs1_v = preissue_v;
@@ -229,25 +238,26 @@ module bp_be_issue_queue
      );
 
   bp_fe_queue_s fe_queue_lo;
-  wire bypass_issue = (wptr_r.mem == rptr_r.mem);
+  wire bypass_issue =
+    (wptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp] == rptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp]);
   bsg_mem_1r1w
    #(.width_p(fe_queue_width_lp), .els_p(fe_queue_fifo_els_p))
    queue_fifo_mem
     (.w_clk_i(clk_i)
      ,.w_reset_i(reset_i)
      ,.w_v_i(|enq)
-     ,.w_addr_i(wptr_r.mem)
+     ,.w_addr_i(wptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp])
      ,.w_data_i(fe_queue_cast_i)
-     ,.r_v_i(~bypass_issue)
-     ,.r_addr_i(rptr_r.mem)
+     ,.r_v_i(|read & ~bypass_issue)
+     ,.r_addr_i(rptr_r[ptr_wrap_bit_lp-1:ptr_base_bit_lp])
      ,.r_data_o(fe_queue_lo)
      );
-  assign fe_queue_ready_and_o = ~full;
+  assign fe_queue_ready_and_o = ~full & ~suppress;
 
-  wire [vaddr_width_p-1:0] issue_pc = fe_queue_lo.pc + (rptr_r.entry << 1'b1);
-  wire [instr_width_gp-1:0] issue_instr = preissue_pkt_r.instr;
-  wire [fetch_ptr_p-1:0] issue_size = issue_pkt_cast_o.fetch ? preissue_pkt_r.size : entry_ptr_width_lp;
-  wire [fetch_ptr_p-1:0] issue_count = fe_queue_lo.count;
+  rv64_instr_fmatype_s issue_instr;
+  assign issue_instr = preissue_pkt_r.instr;
+  wire upper = compressed_support_p & rptr_r[0];
+  wire [vaddr_width_p-1:0] issue_pc = upper ? (fe_queue_lo.pc + 2'b10) : fe_queue_lo.pc;
 
   // Decode the dispatched instruction
   bp_be_decode_s decoded_instr_lo;
@@ -281,12 +291,31 @@ module bp_be_issue_queue
      ,.csrw_o(csrw_lo)
      );
 
+
+
+integer file; // File descriptor
+reg [31:0] prev_preissue_pkt_i; // Register to store the previous preissue_pkt_i
+reg [31:0] prev_time; // Register to store the previous time
+
+
+
+initial begin
+    // Open the file in write mode
+    file = $fopen("/home/cubbins/black-parrot-sim/black-parrot/bp_top/syn/results/verilator/bp_tethered.e_bp_default_cfg.none.sim.bp-tests.hello_world/44issue_queue_values.txt", "w");
+    if (!file) begin
+        $display("Error: Could not open file.");
+        $finish;
+    end
+end
+
+
+
   always_comb
     begin
       issue_pkt_cast_o = '0;
 
-      issue_pkt_cast_o.v                    = en_i & ~empty;
-      issue_pkt_cast_o.fetch                = (fe_queue_lo.msg_type == e_instr_fetch) & !illegal_instr_lo;
+      issue_pkt_cast_o.v                    = ~empty & ~suppress;
+      issue_pkt_cast_o.instr_v              = (fe_queue_lo.msg_type == e_instr_fetch) & ~illegal_instr_lo;
       issue_pkt_cast_o.itlb_miss            = (fe_queue_lo.msg_type == e_itlb_miss);
       issue_pkt_cast_o.instr_access_fault   = (fe_queue_lo.msg_type == e_instr_access_fault);
       issue_pkt_cast_o.instr_page_fault     = (fe_queue_lo.msg_type == e_instr_page_fault);
@@ -307,12 +336,28 @@ module bp_be_issue_queue
 
       issue_pkt_cast_o.pc                   = issue_pc;
       issue_pkt_cast_o.instr                = issue_instr;
-      issue_pkt_cast_o.size                 = issue_size;
-      issue_pkt_cast_o.count                = issue_count;
+      issue_pkt_cast_o.partial              = fe_queue_lo.partial;
       issue_pkt_cast_o.decode               = decoded_instr_lo;
       issue_pkt_cast_o.imm                  = decoded_imm_lo;
       issue_pkt_cast_o.branch_metadata_fwd  = fe_queue_lo.branch_metadata_fwd;
+
+  $fwrite(file, "%0t %0b %0h %0h %0h %0h %0h issue_queue\r\n", 
+  $time,issue_pkt_cast_o.v,issue_pc, issue_instr, fe_queue_lo.partial, decoded_instr_lo, decoded_imm_lo); 
+
+//https://luplab.gitlab.io/rvcodecjs/#q=763&abi=false&isa=AUTO
+
     end
+
+
+
+
+// Close the file at the end of the simulation
+final begin
+    $fclose(file);
+end
+
+
+
 
 endmodule
 
